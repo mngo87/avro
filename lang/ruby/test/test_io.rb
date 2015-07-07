@@ -110,7 +110,7 @@ EOS
                    {"name": "cdr", "type": "string"}]}]
 EOS
     check(union_schema)
-    check_default('["double", "long"]', "1.1", 1.1)
+    #check_default('["double", "long"]', "1.1", 1.1)
   end
 
   def test_lisp
