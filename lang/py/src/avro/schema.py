@@ -123,6 +123,7 @@ class Schema(object):
     if not hasattr(self, '_props'): self._props = {}
     self.set_prop('type', type)
     self.type = type
+    self._fullname = type
     self._props.update(other_props or {})
 
   # Read-only properties dict. Printing schemas
@@ -132,6 +133,8 @@ class Schema(object):
   # Read-only property dict. Non-reserved properties
   other_props = property(lambda self: get_other_props(self._props, SCHEMA_RESERVED_PROPS),
                          doc="dictionary of non-reserved properties")
+
+  fullname = property(lambda self: self._fullname)
 
   # utility functions to manipulate properties dict
   def get_prop(self, key):
@@ -310,7 +313,6 @@ class NamedSchema(Schema):
   # read-only properties
   name = property(lambda self: self.get_prop('name'))
   namespace = property(lambda self: self.get_prop('namespace'))
-  fullname = property(lambda self: self._fullname)
 
 class Field(object):
   def __init__(self, type, name, has_default, default=None,
@@ -392,8 +394,6 @@ class PrimitiveSchema(Schema):
 
     # Call parent ctor
     Schema.__init__(self, type, other_props=other_props)
-
-    self.fullname = type
 
   def to_json(self, names=None):
     if len(self.props) == 1:

@@ -55,6 +55,11 @@ INT_MAX_VALUE = (1 << 31) - 1
 LONG_MIN_VALUE = -(1 << 63)
 LONG_MAX_VALUE = (1 << 63) - 1
 
+# Constants to set type hints level
+HINTS_NONE = 0
+HINTS_PEGASUS = 1
+HINTS_ALL = 2
+
 # TODO(hammer): shouldn't ! be < for little-endian (according to spec?)
 if sys.version_info >= (2, 5, 0):
   struct_class = struct.Struct
@@ -80,10 +85,10 @@ STRUCT_CRC32 = struct_class('>I')   # big-endian unsigned int
 
 class AvroTypeException(schema.AvroException):
   """Raised when datum is not an example of schema."""
-  def __init__(self, expected_schema, datum):
+  def __init__(self, expected_schema, datum, path=""):
     pretty_expected = json.dumps(json.loads(str(expected_schema)), indent=2)
-    fail_msg = "The datum %s is not an example of the schema %s"\
-               % (datum, pretty_expected)
+    fail_msg = "The datum %s is not an example of the schema %s with path:\n%s"\
+               % (datum, pretty_expected, path)
     schema.AvroException.__init__(self, fail_msg)
 
 class SchemaResolutionException(schema.AvroException):
@@ -97,8 +102,9 @@ class SchemaResolutionException(schema.AvroException):
 #
 # Validate
 #
+# Path holds path to subitem with error
 
-def validate(expected_schema, datum):
+def validate(expected_schema, datum, hints=HINTS_NONE, path=[]):
   """Determine if a python datum is an instance of a schema."""
   schema_type = expected_schema.type
   if schema_type == 'null':
@@ -110,10 +116,10 @@ def validate(expected_schema, datum):
   elif schema_type == 'bytes':
     return isinstance(datum, str)
   elif schema_type == 'int':
-    return ((isinstance(datum, int) or isinstance(datum, long)) 
+    return ((isinstance(datum, int) or isinstance(datum, long))
             and INT_MIN_VALUE <= datum <= INT_MAX_VALUE)
   elif schema_type == 'long':
-    return ((isinstance(datum, int) or isinstance(datum, long)) 
+    return ((isinstance(datum, int) or isinstance(datum, long))
             and LONG_MIN_VALUE <= datum <= LONG_MAX_VALUE)
   elif schema_type in ['float', 'double']:
     return (isinstance(datum, int) or isinstance(datum, long)
@@ -123,19 +129,55 @@ def validate(expected_schema, datum):
   elif schema_type == 'enum':
     return datum in expected_schema.symbols
   elif schema_type == 'array':
-    return (isinstance(datum, list) and
-      False not in [validate(expected_schema.items, d) for d in datum])
+    if isinstance(datum, list):
+      for i,d in enumerate(datum):
+        if validate(expected_schema.items, d, hints, path):
+          del path[:]
+        else:
+          path.append(i)
+          return False
+    return True
   elif schema_type == 'map':
-    return (isinstance(datum, dict) and
-      False not in [isinstance(k, basestring) for k in datum.keys()] and
-      False not in
-        [validate(expected_schema.values, v) for v in datum.values()])
+    if not isinstance(datum, dict):
+      return False
+    for k in datum.keys():
+      if not isinstance(k, basestring):
+        path.append('Key is not string: k')
+        return False
+    for v in datum.values():
+      if validate(expected_schema.values, v, hints, path):
+        del path[:]
+      else:
+        path.append(k)
+        return False
+    return True
   elif schema_type in ['union', 'error_union']:
-    return True in [validate(s, datum) for s in expected_schema.schemas]
+    if datum is None:
+      return any(s.fullname == "null" for s in expected_schema.schemas)
+    # check if type hint is expected
+    elif HintRequired(hints, expected_schema):
+      k,v=next(datum.iteritems())
+      return any(s.fullname==k and validate(s, v, hints, []) for s in expected_schema.schemas)
+    else:
+      return any(s.fullname!='null' and validate(s, datum, hints, []) for s in expected_schema.schemas)
   elif schema_type in ['record', 'error', 'request']:
-    return (isinstance(datum, dict) and
-      False not in
-        [validate(f.type, datum.get(f.name)) for f in expected_schema.fields])
+    if not isinstance(datum, dict):
+      return False
+    for f in expected_schema.fields:
+      if validate(f.type, datum.get(f.name), hints, path):
+        del path[:]
+      else:
+        path.append(f.name)
+        return False
+    return True
+  raise schema.AvroException('Unknown primitive type in schema: %s' % schema_type)
+
+
+# Assuming datum represents union is the type hint required.
+def HintRequired(hints, union_schema):
+  return (hints == HINTS_ALL or hints == HINTS_PEGASUS and
+          sum(1 for s in union_schema.schemas if s.type != 'null') > 1)
+
 
 #
 # Decoder/Encoder
@@ -353,7 +395,11 @@ class BinaryEncoder(object):
     A string is encoded as a long followed by
     that many bytes of UTF-8 encoded character data.
     """
-    datum = datum.encode("utf-8")
+    try:
+      datum = datum.encode("utf-8")
+    except:
+      pdb.set_trace()
+      raise
     self.write_bytes(datum)
 
   def write_crc32(self, bytes):
@@ -420,14 +466,15 @@ class DatumReader(object):
       return True
     return False
 
-  def __init__(self, writers_schema=None, readers_schema=None):
+  def __init__(self, writers_schema=None, readers_schema=None,hints=HINTS_NONE):
     """
     As defined in the Avro specification, we call the schema encoded
     in the data the "writer's schema", and the schema expected by the
     reader the "reader's schema".
     """
     self._writers_schema = writers_schema
-    self._readers_schema = readers_schema 
+    self._readers_schema = readers_schema
+    self._hints = hints
 
   # read/write properties
   def set_writers_schema(self, writers_schema):
@@ -649,9 +696,13 @@ class DatumReader(object):
                  % (index_of_schema, len(writers_schema.schemas))
       raise SchemaResolutionException(fail_msg, writers_schema, readers_schema)
     selected_writers_schema = writers_schema.schemas[index_of_schema]
-    
+
     # read data
-    return self.read_data(selected_writers_schema, readers_schema, decoder)
+    data = self.read_data(selected_writers_schema, readers_schema, decoder)
+    if selected_writers_schema.type!='null' and HintRequired(self._hints, writers_schema):
+      return {selected_writers_schema.fullname: data}
+    else:
+      return data
 
   def skip_union(self, writers_schema, decoder):
     index_of_schema = int(decoder.read_long())
@@ -688,12 +739,15 @@ class DatumReader(object):
       readers_field = readers_fields_dict.get(field.name)
       if readers_field is not None:
         field_val = self.read_data(field.type, readers_field.type, decoder)
-        read_record[field.name] = field_val
+        # Skipping items that match absent value for pegasus optional field
+        if (self._hints != HINTS_PEGASUS or field_val is not None or not isinstance(field.type, schema.UnionSchema) or
+            len(field.type.schemas) != 2 or all(field.type.schemas[i].fullname != "null" for i in (0,1))):
+          read_record[field.name] = field_val
       else:
         self.skip_data(field.type, decoder)
 
-    # fill in default values
-    if len(readers_fields_dict) > len(read_record):
+    # fill in default values except for PEGASUS memory objects
+    if self._hints != HINTS_PEGASUS and len(readers_fields_dict) > len(read_record):
       writers_fields_dict = writers_schema.fields_dict
       for field_name, field in readers_fields_dict.items():
         if not writers_fields_dict.has_key(field_name):
@@ -754,8 +808,9 @@ class DatumReader(object):
 
 class DatumWriter(object):
   """DatumWriter for generic python objects."""
-  def __init__(self, writers_schema=None):
+  def __init__(self, writers_schema=None, hints=HINTS_NONE):
     self._writers_schema = writers_schema
+    self._hints = hints
 
   # read/write properties
   def set_writers_schema(self, writers_schema):
@@ -765,9 +820,10 @@ class DatumWriter(object):
 
   def write(self, datum, encoder):
     # validate datum
-    if not validate(self.writers_schema, datum):
-      raise AvroTypeException(self.writers_schema, datum)
-    
+    path = []
+    if not validate(self.writers_schema, datum, self._hints, path):
+      raise AvroTypeException(self.writers_schema, datum, path)
+
     self.write_data(self.writers_schema, datum, encoder)
 
   def write_data(self, writers_schema, datum, encoder):
@@ -870,14 +926,24 @@ class DatumWriter(object):
     """
     # resolve union
     index_of_schema = -1
-    for i, candidate_schema in enumerate(writers_schema.schemas):
-      if validate(candidate_schema, datum):
-        index_of_schema = i
-    if index_of_schema < 0: raise AvroTypeException(writers_schema, datum)
+    if datum!= None and not HintRequired(self._hints, writers_schema):
+      # Trying to deduct the schema. If hints == HINTS_NONE this may not be always unambiguously possible
+      index_of_schema, schema = next(
+          (i, schema) for i, schema in enumerate(writers_schema.schemas) if validate(schema, datum, self._hints, []))
+      v = datum
+    else:
+      if datum is None:
+        schema_name = u"null"
+        v = None
+      elif HintRequired(self._hints, writers_schema):
+        schema_name, v = next(datum.iteritems())
+      # Not checking StopIteration as this should be done already by validate()
+      index_of_schema, schema = next(
+          (i, schema) for i, schema in enumerate(writers_schema.schemas) if schema.fullname == schema_name)
 
     # write data
     encoder.write_long(index_of_schema)
-    self.write_data(writers_schema.schemas[index_of_schema], datum, encoder)
+    self.write_data(writers_schema.schemas[index_of_schema], v, encoder)
 
   def write_record(self, writers_schema, datum, encoder):
     """
